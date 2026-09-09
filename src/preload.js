@@ -10,8 +10,16 @@ contextBridge.exposeInMainWorld('ghostmind', {
     ipcRenderer.invoke('claude-api', { question, systemPrompt }),
 
   // Settings
-  saveApiKey: (key) => ipcRenderer.invoke('save-api-key', key),
-  getApiKey: () => ipcRenderer.invoke('get-api-key'),
+  saveApiKey: (key, provider) => ipcRenderer.invoke('save-api-key', key, provider),
+  getApiKey: (provider) => ipcRenderer.invoke('get-api-key', provider),
+  setProvider: (provider) => ipcRenderer.invoke('set-provider', provider),
+  getProvider: () => ipcRenderer.invoke('get-provider'),
+  setGeminiModel: (model) => ipcRenderer.invoke('set-gemini-model', model),
+  getGeminiModel: () => ipcRenderer.invoke('get-gemini-model'),
+
+  // System audio (meeting loopback)
+  getAudioSources: () => ipcRenderer.invoke('get-audio-sources'),
+  transcribeAudio: (audio, mimeType) => ipcRenderer.invoke('transcribe-audio', { audio, mimeType }),
 
   // Window
   minimize: () => ipcRenderer.send('window-minimize'),

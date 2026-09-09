@@ -12,7 +12,10 @@
     "appId": "com.ghostmind.ai",
     "productName": "GhostMind",
     "win": {
-      "target": ["nsis", "portable"],
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "assets/icon.ico",
       "requestedExecutionLevel": "asUser"
     },
@@ -26,6 +29,7 @@
     "electron-builder": "^24.0.0"
   },
   "dependencies": {
+    "dotenv": "^16.6.1",
     "node-fetch": "^2.7.0"
   }
 }

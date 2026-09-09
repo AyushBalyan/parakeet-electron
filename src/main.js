@@ -10,32 +10,52 @@
  * 6. Process name disguise       → rename process to look like a system service
  */
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, globalShortcut, desktopCapturer } = require('electron');
 const path = require('path');
 const fetch = require('node-fetch');
 const fs = require('fs');
 
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
 // ── Disguise process name (appears as "RuntimeBroker" in Task Manager on Windows)
 // Uncomment the line below to enable process name disguise:
-// app.setName('RuntimeBroker');
+app.setName('RuntimeBroker');
 
 let mainWindow = null;
 let tray = null;
 let isVisible = true;
-let apiKey = '';
+const GEMINI_MODELS = {
+  // Native generateContent thinkingConfig. 3.7 has no documented "minimal".
+  'gemini-3.7-flash': { thinkingConfig: { thinkingLevel: 'low' } },
+  'gemini-2.5-flash': { thinkingConfig: { thinkingBudget: 0 } },
+};
+let provider = 'deepseek'; // 'deepseek' | 'gemini'
+let geminiModel = 'gemini-3.7-flash';
+let apiKeys = { deepseek: '', gemini: '' };
 
 // ── Load saved API key
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+function applyEnvKeys() {
+  const deepseek = typeof process.env.DEEPSEEK_API_KEY === 'string' ? process.env.DEEPSEEK_API_KEY.trim() : '';
+  const gemini = typeof process.env.GEMINI_API_KEY === 'string' ? process.env.GEMINI_API_KEY.trim() : '';
+  if (deepseek) apiKeys.deepseek = deepseek;
+  if (gemini) apiKeys.gemini = gemini;
+}
+
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
       const cfg = JSON.parse(raw);
-      if (cfg && typeof cfg === 'object' && typeof cfg.apiKey === 'string') {
-        apiKey = cfg.apiKey;
+      if (cfg && typeof cfg === 'object') {
+        if (typeof cfg.apiKey === 'string' && !apiKeys.deepseek) apiKeys.deepseek = cfg.apiKey;
+        if (typeof cfg.geminiApiKey === 'string' && !apiKeys.gemini) apiKeys.gemini = cfg.geminiApiKey;
+        if (cfg.provider === 'deepseek' || cfg.provider === 'gemini') provider = cfg.provider;
+        if (cfg.geminiModel && GEMINI_MODELS[cfg.geminiModel]) geminiModel = cfg.geminiModel;
       }
     }
   } catch (e) { console.error('Config load error:', e.message); }
+  applyEnvKeys();
 }
 function saveConfig(cfg) {
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return;
@@ -49,7 +69,7 @@ function saveConfig(cfg) {
       }
     }
     // Only allow known keys to prevent prototype pollution
-    const allowed = ['apiKey'];
+    const allowed = ['apiKey', 'geminiApiKey', 'provider', 'geminiModel'];
     const safe = {};
     for (const k of allowed) {
       if (k in cfg) safe[k] = cfg[k];
@@ -108,7 +128,7 @@ function createWindow() {
       responseHeaders: {
         ...details.responseHeaders,
         'Content-Security-Policy': [
-          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://api.anthropic.com; img-src 'self' data:;"
+          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://api.deepseek.com https://generativelanguage.googleapis.com; img-src 'self' data:;"
         ]
       }
     });
@@ -227,10 +247,73 @@ function registerShortcuts() {
 
 // ── IPC Handlers (renderer <-> main communication)
 
-// Claude API call (done in main process — API key never exposed to renderer)
+// AI API call (done in main process — API key never exposed to renderer)
+// Routes to DeepSeek (Anthropic-compatible) or Gemini (OpenAI-compatible) based on provider.
+async function callDeepSeek(question, systemPrompt, key) {
+  const response = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'deepseek-v4-pro',
+      max_tokens: 1024,
+      system: systemPrompt,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: question }],
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    return { error: err?.error?.message || `API error ${response.status}` };
+  }
+  const data = await response.json();
+  const text = data.content?.[0]?.text;
+  if (typeof text !== 'string') return { error: 'Unexpected API response format.' };
+  return { text };
+}
+
+async function callGemini(question, systemPrompt, key) {
+  const model = GEMINI_MODELS[geminiModel] ? geminiModel : 'gemini-3.7-flash';
+  const thinkingConfig = GEMINI_MODELS[model].thinkingConfig;
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': key,
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: question }] }],
+        generationConfig: {
+          maxOutputTokens: 1024,
+          thinkingConfig,
+        },
+      }),
+    }
+  );
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    const detail = err?.error?.message || err?.message || response.statusText;
+    return { error: `API error ${response.status}: ${detail}` };
+  }
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts
+    ?.map((p) => (typeof p.text === 'string' ? p.text : ''))
+    .join('')
+    .trim();
+  if (!text) return { error: 'Unexpected API response format.' };
+  return { text };
+}
+
 ipcMain.handle('claude-api', async (event, payload) => {
-  if (!apiKey) {
-    return { error: 'No API key set. Go to Settings to add your Anthropic API key.' };
+  const key = apiKeys[provider];
+  if (!key) {
+    return { error: `No API key set. Go to Settings to add your ${provider === 'gemini' ? 'Gemini' : 'DeepSeek'} API key.` };
   }
   // Validate payload shape
   if (!payload || typeof payload !== 'object') return { error: 'Invalid request payload.' };
@@ -239,49 +322,108 @@ ipcMain.handle('claude-api', async (event, payload) => {
   if (!question.trim()) return { error: 'Empty question.' };
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: question }],
-      }),
-    });
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      return { error: err?.error?.message || `API error ${response.status}` };
-    }
-    const data = await response.json();
-    const text = data.content?.[0]?.text;
-    if (typeof text !== 'string') return { error: 'Unexpected API response format.' };
-    return { text };
+    return provider === 'gemini'
+      ? await callGemini(question, systemPrompt, key)
+      : await callDeepSeek(question, systemPrompt, key);
   } catch (e) {
     return { error: e.message };
   }
 });
 
-// Save API key securely in userData folder
-ipcMain.handle('save-api-key', async (event, key) => {
-  if (typeof key !== 'string' || !key.startsWith('sk-ant-') || key.length > 300 || key.length < 20) {
+// Save API key securely in userData folder (per-provider)
+ipcMain.handle('save-api-key', async (event, key, forProvider) => {
+  const target = forProvider === 'gemini' ? 'gemini' : 'deepseek';
+  if (typeof key !== 'string' || key.length > 300 || key.length < 20) {
     return { ok: false, error: 'Invalid API key format.' };
+  }
+  if (target === 'deepseek' && !key.startsWith('sk-')) {
+    return { ok: false, error: 'DeepSeek keys start with sk-.' };
   }
   // Strip any whitespace
   const cleanKey = key.trim();
-  apiKey = cleanKey;
-  saveConfig({ apiKey: cleanKey });
+  apiKeys[target] = cleanKey;
+  saveConfig(target === 'gemini' ? { geminiApiKey: cleanKey } : { apiKey: cleanKey });
   return { ok: true };
 });
 
-// Get saved API key (masked)
-ipcMain.handle('get-api-key', async () => {
-  return apiKey ? apiKey.slice(0, 8) + '...' + apiKey.slice(-4) : '';
+// Get saved API key (masked) for a provider
+ipcMain.handle('get-api-key', async (event, forProvider) => {
+  const target = forProvider === 'gemini' ? 'gemini' : 'deepseek';
+  const key = apiKeys[target];
+  return key ? key.slice(0, 8) + '...' + key.slice(-4) : '';
 });
+
+// Provider selection
+ipcMain.handle('set-provider', async (event, p) => {
+  if (p !== 'deepseek' && p !== 'gemini') return { ok: false };
+  provider = p;
+  saveConfig({ provider: p });
+  return { ok: true };
+});
+ipcMain.handle('get-provider', async () => provider);
+
+// ── System audio (meeting loopback) — Windows only
+// List capturable windows/screens so the user can pick the meeting app
+ipcMain.handle('get-audio-sources', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({ types: ['window', 'screen'] });
+    return sources.map(s => ({ id: s.id, name: s.name }));
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+// Transcribe a recorded system-audio chunk via Gemini's native audio input.
+// SpeechRecognition can't consume a loopback stream, so we send audio to Gemini.
+ipcMain.handle('transcribe-audio', async (event, payload) => {
+  const key = apiKeys.gemini;
+  if (!key) return { error: 'Meeting audio transcription needs a Gemini API key (Settings).' };
+  if (!payload || typeof payload !== 'object') return { error: 'Invalid payload.' };
+  const audioBase64 = typeof payload.audio === 'string' ? payload.audio : '';
+  const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType : 'audio/webm';
+  if (!audioBase64 || audioBase64.length > 20_000_000) return { error: 'Invalid audio chunk.' };
+
+  try {
+    const response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({
+          contents: [{
+            role: 'user',
+            parts: [
+              { inline_data: { mime_type: mimeType, data: audioBase64 } },
+              { text: 'Transcribe the speech in this audio exactly as spoken. If there is no clear speech, reply with nothing. Output only the transcript, no commentary.' },
+            ],
+          }],
+          generationConfig: { maxOutputTokens: 512, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }
+    );
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      const detail = err?.error?.message || response.statusText;
+      return { error: `API error ${response.status}: ${detail}` };
+    }
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts
+      ?.map((p) => (typeof p.text === 'string' ? p.text : ''))
+      .join('')
+      .trim();
+    return { text: text || '' };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+ipcMain.handle('set-gemini-model', async (event, model) => {
+  if (!GEMINI_MODELS[model]) return { ok: false };
+  geminiModel = model;
+  saveConfig({ geminiModel: model });
+  return { ok: true };
+});
+ipcMain.handle('get-gemini-model', async () => geminiModel);
 
 // Window controls
 ipcMain.on('window-minimize', () => mainWindow?.minimize());
