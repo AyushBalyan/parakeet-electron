@@ -27,7 +27,7 @@ let isVisible = true;
 const GEMINI_MODELS = {
   // Native generateContent thinkingConfig. 3.7 has no documented "minimal".
   'gemini-3.7-flash': { thinkingConfig: { thinkingLevel: 'low' } },
-  'gemini-2.5-flash': { thinkingConfig: { thinkingBudget: 0 } },
+  'gemini-3.6-flash': { thinkingConfig: { thinkingLevel: 'minimal' } },
 };
 let provider = 'deepseek'; // 'deepseek' | 'gemini'
 let geminiModel = 'gemini-3.7-flash';
@@ -385,7 +385,7 @@ ipcMain.handle('transcribe-audio', async (event, payload) => {
 
   try {
     const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -397,7 +397,7 @@ ipcMain.handle('transcribe-audio', async (event, payload) => {
               { text: 'Transcribe the speech in this audio exactly as spoken. If there is no clear speech, reply with nothing. Output only the transcript, no commentary.' },
             ],
           }],
-          generationConfig: { maxOutputTokens: 512, thinkingConfig: { thinkingBudget: 0 } },
+          generationConfig: { maxOutputTokens: 512, thinkingConfig: { thinkingLevel: 'minimal' } },
         }),
       }
     );
